@@ -16,7 +16,7 @@ using SwiftlyS2.Shared.SchemaDefinitions;
 
 namespace MapChooser;
 
-[PluginMetadata(Id = "MapChooser", Version = "1.3.2", Name = "Map Chooser", Author = "aga", Description = "Map chooser plugin for SwiftlyS2")]
+[PluginMetadata(Id = "MapChooser", Version = "1.3.5.1", Name = "Map Chooser", Author = "aga", Description = "Map chooser plugin for SwiftlyS2 - Edited for Arenas")]
 public sealed class MapChooser : BasePlugin
 {
     private MapChooserConfig _config = new();
@@ -129,7 +129,7 @@ public sealed class MapChooser : BasePlugin
         Core.GameEvent.HookPost<EventRoundStart>(OnRoundStart);
         Core.GameEvent.HookPost<EventRoundAnnounceWarmup>(OnAnnounceWarmup);
         Core.GameEvent.HookPost<EventWarmupEnd>(OnWarmupEnd);
-        Core.GameEvent.HookPost<EventCsWinPanelMatch>(OnWinPanelMatch);
+        Core.GameEvent.HookPre<EventCsWinPanelMatch>(OnWinPanelMatch);
         Core.GameEvent.HookPost<EventGamePhaseChanged>(OnGamePhaseChanged);
         Core.GameEvent.HookPost<EventRoundAnnounceMatchStart>(OnMatchStart);
         Core.GameEvent.HookPost<EventRoundAnnounceMatchPoint>(OnMatchPoint);
@@ -180,6 +180,8 @@ public sealed class MapChooser : BasePlugin
         _mapCooldown.OnMapStart(@event.MapName, workshopId);
         _cycleManager.OnMapStart(@event.MapName, workshopId);
 
+
+    
         _checkVoteTimer = Core.Scheduler.DelayAndRepeat(1000, 1000, () =>
         {
             CheckAutomatedVote();
@@ -215,7 +217,34 @@ public sealed class MapChooser : BasePlugin
 
     private HookResult OnMatchStart(EventRoundAnnounceMatchStart @event)
     {
-        _eofManager?.ResetVote();
+        if (_config.DetailedLogging)
+            Core.Logger.LogInformation(
+                "MapChooser: OnMatchStart fired. roundsPlayed={Rounds} eofVoteHappening={Eof}",
+                _state.RoundsPlayed, _state.EofVoteHappening);
+
+        // EventRoundAnnounceMatchStart is meant to fire once per map (right after
+        // warmup), but on non-competitive game modes that restart each round
+        // themselves (arena/duel/ladder style plugins calling mp_restartgame per
+        // round) the engine can re-announce "match start" every round. If that
+        // happens while an RTV/EOF vote is active, silently wiping it here makes
+        // a player's vote vanish with zero feedback and lets !rtv be used again
+        // right away, looking like the vote never happened.
+        if (_state.EofVoteHappening)
+        {
+            if (_config.DetailedLogging)
+                Core.Logger.LogWarning(
+                    "MapChooser: OnMatchStart fired while a vote was active (isRtv={IsRtv}). " +
+                    "This usually means the game mode re-announces match start every round " +
+                    "instead of once per map - cancelling the vote visibly instead of wiping it silently.",
+                    _state.IsRtv);
+
+            _eofManager?.CancelVote();
+        }
+        else
+        {
+            _eofManager?.ResetVote();
+        }
+
         _state.RoundsPlayed = 0;
         try
         {
@@ -259,7 +288,21 @@ public sealed class MapChooser : BasePlugin
             Core.Logger.LogWarning(ex, "GameRules not available in OnWinPanelMatch - proceeding without halftime check");
         }
 
+        if(_checkVoteTimer != null)
+        {
+            _checkVoteTimer.Cancel();
+            _checkVoteTimer = null;
+        }
+
         _state.MatchEnded = true;
+
+        if (_config.EndOfMap.ForceOnWinPanelMatch)
+        {
+            _changeMapManager.ChangeMap();
+            return HookResult.Continue;
+        }
+
+
         if (_state.EofVoteHappening)
             _eofManager.ForceEnd();
         else if (_state.MapChangeScheduled)
@@ -422,18 +465,31 @@ public sealed class MapChooser : BasePlugin
     {
         try
         {
-            var teams = Core.EntitySystem.GetAllEntitiesByClass<CCSTeam>();
+            // Snapshot immediately - GetAllEntitiesByClass<T>() is a lazy IEnumerable
+            // backed by SwiftlyS2's EntityManager, whose internal lock only protects
+            // list bookkeeping, not the deferred enumeration. Re-validating IsValid
+            // right before each field read narrows (but doesn't eliminate) the window
+            // where a team entity gets destroyed by the engine mid-iteration and a
+            // schema field read dereferences freed native memory - a hard native
+            // crash no try/catch can stop.
+            var teams = Core.EntitySystem.GetAllEntitiesByClass<CCSTeam>().ToList();
+
             int maxTeamScore = 0;
             foreach (var team in teams)
             {
+                if (team is not { IsValid: true })
+                    continue;
+
                 int score = team.ScoreFirstHalf + team.ScoreSecondHalf + team.ScoreOvertime;
-                if (score > maxTeamScore) maxTeamScore = score;
+                if (score > maxTeamScore)
+                    maxTeamScore = score;
             }
+
             return maxTeamScore;
         }
         catch (Exception ex)
         {
-            Core.Logger.LogWarning(ex, "MapChooser: failed to read team scores");
+            Core.Logger.LogWarning(ex, "MapChooser: TryGetMaxTeamScore failed");
             return 0;
         }
     }

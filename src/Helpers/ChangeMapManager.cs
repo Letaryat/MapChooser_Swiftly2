@@ -58,8 +58,8 @@ public class ChangeMapManager
         if (string.IsNullOrEmpty(_state.NextMap))
         {
             if (_config.DetailedLogging)
-                _core.Logger.LogInformation("MapChooser: ChangeMap aborted — NextMap is empty.");
-            return;
+                _state.NextMap = _core.Engine.GlobalVars.MapName;
+                _core.Logger.LogInformation("MapChooser: ChangeMap aborted — NextMap is empty - Changing NextMap to current one.");
         }
 
         var mapName = _state.NextMap;
@@ -128,6 +128,9 @@ public class ChangeMapManager
         // the delay fires, the scheduler will auto-cancel this token.
         _core.Scheduler.StopOnMapChange(_pendingChange);
     }
+
+
+
 
     /// <summary>Cancel any pending map-change callback (used during plugin unload).</summary>
     public void CancelPending()

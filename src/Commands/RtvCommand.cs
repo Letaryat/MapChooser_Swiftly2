@@ -79,6 +79,18 @@ public class RtvCommand
             return;
         }
 
+        // A winning map from a previous RTV vote is already queued to actually
+        // switch (ChangeMapManager.ChangeMap is mid-delay). MapChangeScheduled is
+        // already false by this point (ChangeMap clears it immediately once it
+        // starts), so without this check a new !rtv here would silently win the
+        // race: the new vote's own ChangeMap() call later no-ops against
+        // MapSwitchInFlight with zero feedback to anyone.
+        if (_state.MapSwitchInFlight)
+        {
+            player.SendChat(localizer["map_chooser.prefix"] + " " + localizer["map_chooser.rtv.change_scheduled"]);
+            return;
+        }
+
         if (_state.EofVoteHappening)
         {
             if (!_eofManager.HasPlayerVoted(player.Slot))

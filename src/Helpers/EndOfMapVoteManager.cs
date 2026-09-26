@@ -87,7 +87,7 @@ public class EndOfMapVoteManager
 
     public void StartVote(int voteDuration, int mapsToShow, bool changeImmediately = false, bool isRtv = false)
     {
-        if (_voteActive) return;
+        if (_voteActive || _state.MapSwitchInFlight) return;
 
         _voteSessionId++;
 
@@ -190,7 +190,7 @@ public class EndOfMapVoteManager
 
     public void StartCustomVote(List<string> maps, int voteDuration, bool changeImmediately = false)
     {
-        if (_voteActive) return;
+        if (_voteActive || _state.MapSwitchInFlight) return;
 
         _voteSessionId++;
 
@@ -430,6 +430,14 @@ public class EndOfMapVoteManager
                 
                 bool changeImmediately = _changeImmediately || _state.MatchEnded;
                 _changeMapManager.ScheduleMapChange(winner, changeImmediately, _isRtvVote);
+
+                // A successful RTV vote used to leave no cooldown at all, only the
+                // "nobody voted" failure path set one. That let anyone immediately
+                // start a brand new !rtv while the winning map change was still
+                // pending (see MapSwitchInFlight check in RtvCommand), which is
+                // what made map changes seem to need several rtv attempts.
+                if (_isRtvVote)
+                    _state.RtvCooldownEndTime = DateTime.Now.AddSeconds(_config.Rtv.VoteCooldownTime);
             }
         }
         finally
