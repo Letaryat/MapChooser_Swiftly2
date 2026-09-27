@@ -36,6 +36,7 @@ public class EndOfMapConfig
     public int ExtendRoundStep { get; set; } = 5;
     public int ExtendLimit { get; set; } = 3;
     public bool ForceOnWinPanelMatch {get; set;} = true;
+    public int MaxOvertimeSeconds { get; set; } = 120;
 }
 
 public class ExtendMapConfig

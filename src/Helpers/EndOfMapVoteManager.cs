@@ -99,8 +99,21 @@ public class EndOfMapVoteManager
         _playerVotes.Clear();
         _playersReceivedMenu.Clear();
 
-        var currentMapId = _core.Engine.GlobalVars.MapName.ToString();
-        var currentWorkshopId = _core.Engine.WorkshopId;
+        string currentMapId = "";
+        string currentWorkshopId = "";
+        try
+        {
+            if (_core.Engine != null)
+            {
+                currentMapId = _core.Engine.GlobalVars.MapName.ToString();
+                currentWorkshopId = _core.Engine.WorkshopId ?? string.Empty;
+            }
+        }
+        catch
+        {
+            currentMapId = string.Empty;
+            currentWorkshopId = string.Empty;
+        }
 
         var playerCount = _core.PlayerManager.GetAllPlayers()
             .Count(p => p.IsValid && !p.IsFakeClient);

@@ -34,4 +34,12 @@ public class PluginState
     /// </summary>
     public bool MapSwitchInFlight { get; set; }
     public Dictionary<int, string> Nominations { get; set; } = new();
+
+    /// <summary>
+    /// Set once, unconditionally, in OnMapLoad - unlike MapStartTime this never depends
+    /// on native warmup/match-start events, which some custom game modes (e.g. K4-Arenas'
+    /// continuous ladder rounds) never fire. Used purely as a watchdog baseline.
+    /// </summary>
+    public float MapLoadTime { get; set; }
+
 }

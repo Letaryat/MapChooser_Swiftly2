@@ -16,7 +16,7 @@ using SwiftlyS2.Shared.SchemaDefinitions;
 
 namespace MapChooser;
 
-[PluginMetadata(Id = "MapChooser", Version = "1.3.5.1", Name = "Map Chooser", Author = "aga", Description = "Map chooser plugin for SwiftlyS2 - Edited for Arenas")]
+[PluginMetadata(Id = "MapChooser", Version = "1.3.5.2", Name = "Map Chooser", Author = "aga", Description = "Map chooser plugin for SwiftlyS2 - Edited for Arenas")]
 public sealed class MapChooser : BasePlugin
 {
     private MapChooserConfig _config = new();
@@ -130,16 +130,21 @@ public sealed class MapChooser : BasePlugin
         Core.GameEvent.HookPost<EventRoundAnnounceWarmup>(OnAnnounceWarmup);
         Core.GameEvent.HookPost<EventWarmupEnd>(OnWarmupEnd);
         Core.GameEvent.HookPre<EventCsWinPanelMatch>(OnWinPanelMatch);
+
         Core.GameEvent.HookPost<EventGamePhaseChanged>(OnGamePhaseChanged);
         Core.GameEvent.HookPost<EventRoundAnnounceMatchStart>(OnMatchStart);
         Core.GameEvent.HookPost<EventRoundAnnounceMatchPoint>(OnMatchPoint);
-        Core.Event.OnMapLoad += OnMapLoad;
 
+        Core.Event.OnMapLoad += OnMapLoad;
+        //Core.Event.OnMapUnload += OnMapUnLoad;
+
+        
         _checkVoteTimer = Core.Scheduler.DelayAndRepeat(1000, 1000, () =>
         {
-            CheckAutomatedVote();
+            Core.Scheduler.NextTick(() => CheckAutomatedVote());
         });
         Core.Scheduler.StopOnMapChange(_checkVoteTimer);
+        
     }
 
     private void OnMapLoad(IOnMapLoadEvent @event)
@@ -161,6 +166,18 @@ public sealed class MapChooser : BasePlugin
         // when the engine is fully initialized (avoiding crash from accessing GlobalVars during map load)
         _state.MapStartTime = 0;
 
+        // Unlike MapStartTime, this is set unconditionally and never depends on native
+        // warmup/match-start events firing - used only by the overtime watchdog below.
+        try
+        {
+            _state.MapLoadTime = Core.Engine is { } e ? e.GlobalVars.CurrentTime : 0;
+        }
+        catch
+        {
+            _state.MapLoadTime = 0;
+        }
+
+
         _state.RtvCooldownEndTime = null;
         _state.IsRtv = false;
         _state.ChangeMapImmediately = false;
@@ -181,12 +198,14 @@ public sealed class MapChooser : BasePlugin
         _cycleManager.OnMapStart(@event.MapName, workshopId);
 
 
-    
+        RestartVoteTimer();
+        /*
         _checkVoteTimer = Core.Scheduler.DelayAndRepeat(1000, 1000, () =>
         {
-            CheckAutomatedVote();
+            Core.Scheduler.NextTick(() => CheckAutomatedVote());
         });
         Core.Scheduler.StopOnMapChange(_checkVoteTimer);
+        */
     }
 
     private HookResult OnRoundStart(EventRoundStart @event)
@@ -288,7 +307,20 @@ public sealed class MapChooser : BasePlugin
             Core.Logger.LogWarning(ex, "GameRules not available in OnWinPanelMatch - proceeding without halftime check");
         }
 
-        if(_checkVoteTimer != null)
+        ForceMapEnd("EventCsWinPanelMatch");
+        return HookResult.Continue;
+    }
+
+    /// <summary>
+    /// Shared "the match is over, act on it" logic - used both by the real
+    /// EventCsWinPanelMatch/EventGamePhaseChanged hooks and by the overtime watchdog
+    /// when normal detection never fires at all.
+    /// </summary>
+    private void ForceMapEnd(string reason)
+    {
+        if (_state.MatchEnded) return;
+
+        if (_checkVoteTimer != null)
         {
             _checkVoteTimer.Cancel();
             _checkVoteTimer = null;
@@ -296,12 +328,14 @@ public sealed class MapChooser : BasePlugin
 
         _state.MatchEnded = true;
 
+        if (_config.DetailedLogging)
+            Core.Logger.LogInformation("MapChooser: forcing map end ({Reason})", reason);
+
         if (_config.EndOfMap.ForceOnWinPanelMatch)
         {
             _changeMapManager.ChangeMap();
-            return HookResult.Continue;
+            return;
         }
-
 
         if (_state.EofVoteHappening)
             _eofManager.ForceEnd();
@@ -309,7 +343,6 @@ public sealed class MapChooser : BasePlugin
             _changeMapManager.ChangeMap();
         else if (_config.Cycle.Enabled)
             _cycleManager.TriggerCycleChange();
-        return HookResult.Continue;
     }
 
     private HookResult OnGamePhaseChanged(EventGamePhaseChanged @event)
@@ -355,11 +388,38 @@ public sealed class MapChooser : BasePlugin
     {
         try
         {
+            CheckMatchTimeWatchdog();
             CheckAutomatedVoteCore(force);
         }
         catch (Exception ex)
         {
             Core.Logger.LogError(ex, "MapChooser: CheckAutomatedVote threw");
+        }
+    }
+
+    /// <summary>
+    /// Safety net for when the normal warmup/match-start based timer tracking never
+    /// initializes (e.g. a custom game mode like K4-Arenas that never fires
+    /// EventWarmupEnd, leaving WarmupRunning stuck true forever). Measures elapsed
+    /// time from the unconditional MapLoadTime baseline instead, and forces the
+    /// same end-of-match flow OnWinPanelMatch would trigger if the map has clearly
+    /// overrun mp_timelimit by more than MaxOvertimeSeconds.
+    /// </summary>
+    private void CheckMatchTimeWatchdog()
+    {
+        if (_state.MatchEnded || _state.MapChangeScheduled) return;
+        if (_config.EndOfMap.MaxOvertimeSeconds <= 0) return;
+        if (Core.Engine == null || _state.MapLoadTime <= 0) return;
+        var timelimitConVar = Core.ConVar.Find<float>("mp_timelimit");
+        float timelimit = timelimitConVar?.Value ?? 0;
+        if (timelimit <= 0) return;
+        if (!TryGetEngineCurrentTime(out float currentTime)) return;
+        float timeSinceLoad = currentTime - _state.MapLoadTime;
+        float overtime = timeSinceLoad - (timelimit * 60);
+
+        if (overtime >= _config.EndOfMap.MaxOvertimeSeconds)
+        {
+            ForceMapEnd($"map running {overtime:F0}s past mp_timelimit with no normal end-of-match trigger");
         }
     }
 
@@ -390,30 +450,45 @@ public sealed class MapChooser : BasePlugin
         {
             if (_state.EofVoteCompleted) return;
             if (totalRoundsPlayed < _state.NextEofVotePossibleRound) return;
-            if (Core.Engine != null && Core.Engine.GlobalVars.CurrentTime < _state.NextEofVotePossibleTime) return;
+            if (TryGetEngineCurrentTime(out float currentTime) && currentTime < _state.NextEofVotePossibleTime) return;
         }
 
-        var timelimitConVar = Core.ConVar.Find<float>("mp_timelimit");
-        var maxroundsConVar = Core.ConVar.Find<int>("mp_maxrounds");
-        var winlimitConVar = Core.ConVar.Find<int>("mp_winlimit");
+        float timelimit;
+        int maxrounds;
+        int winlimit;
+        try
+        {
+            var timelimitConVar = Core.ConVar.Find<float>("mp_timelimit");
+            var maxroundsConVar = Core.ConVar.Find<int>("mp_maxrounds");
+            var winlimitConVar = Core.ConVar.Find<int>("mp_winlimit");
 
-        float timelimit = timelimitConVar?.Value ?? 0;
-        int maxrounds = maxroundsConVar?.Value ?? 0;
-        int winlimit = winlimitConVar?.Value ?? 0;
+            timelimit = timelimitConVar?.Value ?? 0;
+            maxrounds = maxroundsConVar?.Value ?? 0;
+            winlimit = winlimitConVar?.Value ?? 0;
+        }
+        catch (Exception)
+        {
+            // Some custom game modes can leave ConVar state unstable during map startup or restart.
+            // Treat it as 'not ready yet' and skip this tick instead of risking a crash.
+            return;
+        }
 
         bool trigger = false;
 
-        if (timelimit > 0 && Core.Engine != null)
+        if (timelimit > 0)
         {
-            if (_state.MapStartTime <= 0)
+            if (TryGetEngineCurrentTime(out float currentTime))
             {
-                _state.MapStartTime = Core.Engine.GlobalVars.CurrentTime;
-            }
-            float timePlayed = Core.Engine.GlobalVars.CurrentTime - _state.MapStartTime;
-            float timeRemaining = (timelimit * 60) - timePlayed;
-            if (timeRemaining <= _config.EndOfMap.TriggerSecondsBeforeEnd)
-            {
-                trigger = true;
+                if (_state.MapStartTime <= 0)
+                {
+                    _state.MapStartTime = currentTime;
+                }
+                float timePlayed = currentTime - _state.MapStartTime;
+                float timeRemaining = (timelimit * 60) - timePlayed;
+                if (timeRemaining <= _config.EndOfMap.TriggerSecondsBeforeEnd)
+                {
+                    trigger = true;
+                }
             }
         }
 
@@ -428,7 +503,7 @@ public sealed class MapChooser : BasePlugin
 
         if (!trigger && winlimit > 0)
         {
-            int maxTeamScore = TryGetMaxTeamScore();
+            int maxTeamScore = GetMaxTeamScore();
             if (winlimit - maxTeamScore <= _config.EndOfMap.TriggerRoundsBeforeEnd)
             {
                 trigger = true;
@@ -439,7 +514,7 @@ public sealed class MapChooser : BasePlugin
         if (!trigger && winlimit == 0 && maxrounds > 0)
         {
             int effectiveWinlimit = maxrounds / 2 + 1;
-            int maxTeamScore = TryGetMaxTeamScore();
+            int maxTeamScore = GetMaxTeamScore();
             if (effectiveWinlimit - maxTeamScore <= _config.EndOfMap.TriggerRoundsBeforeEnd)
             {
                 trigger = true;
@@ -450,9 +525,28 @@ public sealed class MapChooser : BasePlugin
         {
             _state.EofVoteCompleted = false;
             _state.NextEofVotePossibleRound = totalRoundsPlayed + 1;
-            if (Core.Engine != null)
-                _state.NextEofVotePossibleTime = Core.Engine.GlobalVars.CurrentTime + _config.EndOfMap.VoteDuration + 1;
+            if (TryGetEngineCurrentTime(out float currentTime))
+                _state.NextEofVotePossibleTime = currentTime + _config.EndOfMap.VoteDuration + 1;
             _eofManager.StartVote(_config.EndOfMap.VoteDuration, _config.EndOfMap.MapsToShow);
+        }
+    }
+
+    private int GetMaxTeamScore()
+    {
+        try
+        {
+            if (Core.Game == null)
+                return 0;
+
+            var match = Core.Game.MatchData;
+            return Math.Max(match.CTScoreTotal, match.TerroristScoreTotal);
+        }
+        catch (Exception)
+        {
+            // MatchData can be transiently invalid during map startup / shutdown.
+            // Returning 0 keeps the automated-vote check conservative and avoids
+            // touching unstable native match state while the match is still being set up.
+            return 0;
         }
     }
 
@@ -491,6 +585,22 @@ public sealed class MapChooser : BasePlugin
         {
             Core.Logger.LogWarning(ex, "MapChooser: TryGetMaxTeamScore failed");
             return 0;
+        }
+    }
+
+    private bool TryGetEngineCurrentTime(out float time)
+    {
+        time = 0;
+        try
+        {
+            if (Core.Engine == null) return false;
+            time = Core.Engine.GlobalVars.CurrentTime;
+            return true;
+        }
+        catch (Exception ex)
+        {
+            Core.Logger.LogWarning(ex, "MapChooser: failed to read Engine GlobalVars.CurrentTime");
+            return false;
         }
     }
 
@@ -545,4 +655,19 @@ public sealed class MapChooser : BasePlugin
             Core.Logger.LogError(ex, "MapChooser: Unload cleanup failed");
         }
     }
+
+
+    private void RestartVoteTimer()
+    {
+        _checkVoteTimer?.Cancel();
+        _checkVoteTimer = null;
+
+        _checkVoteTimer = Core.Scheduler.DelayAndRepeat(1000, 1000, () =>
+        {
+            Core.Scheduler.NextTick(() => CheckAutomatedVote());
+        });
+
+        Core.Scheduler.StopOnMapChange(_checkVoteTimer);
+    }
+
 }
