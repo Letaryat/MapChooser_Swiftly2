@@ -16,7 +16,7 @@ using SwiftlyS2.Shared.SchemaDefinitions;
 
 namespace MapChooser;
 
-[PluginMetadata(Id = "MapChooser", Version = "1.3.5.2", Name = "Map Chooser", Author = "aga", Description = "Map chooser plugin for SwiftlyS2 - Edited for Arenas")]
+[PluginMetadata(Id = "MapChooser", Version = "1.3.5.3", Name = "Map Chooser", Author = "aga", Description = "Map chooser plugin for SwiftlyS2 - Edited for Arenas")]
 public sealed class MapChooser : BasePlugin
 {
     private MapChooserConfig _config = new();
@@ -48,6 +48,9 @@ public sealed class MapChooser : BasePlugin
     private RemoveMapCommand _removeMapCmd = null!;
 
     private CancellationTokenSource? _checkVoteTimer;
+
+    private bool _gameLive;        // true dopiero po pierwszym RoundStart na tej mapie
+    private int _lastTotalRounds;  // ostatnia znana suma rund z MatchData
 
     public MapChooser(ISwiftlyCore core) : base(core)
     {
@@ -138,19 +141,23 @@ public sealed class MapChooser : BasePlugin
         Core.Event.OnMapLoad += OnMapLoad;
         //Core.Event.OnMapUnload += OnMapUnLoad;
 
-        
+
         _checkVoteTimer = Core.Scheduler.DelayAndRepeat(1000, 1000, () =>
         {
             Core.Scheduler.NextTick(() => CheckAutomatedVote());
         });
         Core.Scheduler.StopOnMapChange(_checkVoteTimer);
-        
+
     }
 
     private void OnMapLoad(IOnMapLoadEvent @event)
     {
         if (@event.MapName == null) return;
         if (string.IsNullOrEmpty(@event.MapName)) return;
+
+        _gameLive = false;
+        _lastTotalRounds = 0;
+
 
         _eofManager?.ResetVote();
         _state.MapChangeScheduled = false;
@@ -210,6 +217,7 @@ public sealed class MapChooser : BasePlugin
 
     private HookResult OnRoundStart(EventRoundStart @event)
     {
+        _gameLive = true;
         CheckAutomatedVote();
         return HookResult.Continue;
     }
@@ -326,6 +334,7 @@ public sealed class MapChooser : BasePlugin
             _checkVoteTimer = null;
         }
 
+        _gameLive = false;
         _state.MatchEnded = true;
 
         if (_config.DetailedLogging)
@@ -349,6 +358,8 @@ public sealed class MapChooser : BasePlugin
     {
         if (@event.NewPhase != (short)GamePhase.GAMEPHASE_MATCH_ENDED) return HookResult.Continue;
         if (_state.MatchEnded) return HookResult.Continue;
+
+        _gameLive = false;
 
         _state.MatchEnded = true;
         if (_state.EofVoteHappening)
@@ -384,12 +395,13 @@ public sealed class MapChooser : BasePlugin
         return HookResult.Continue;
     }
 
-    private void CheckAutomatedVote(bool force = false)
+    private void CheckAutomatedVote(bool force = false, bool fromTimer = false)
     {
+        if (!_gameLive || _state.MatchEnded || _state.MapSwitchInFlight) return;
         try
         {
             CheckMatchTimeWatchdog();
-            CheckAutomatedVoteCore(force);
+            CheckAutomatedVoteCore(force, fromTimer);
         }
         catch (Exception ex)
         {
@@ -397,51 +409,26 @@ public sealed class MapChooser : BasePlugin
         }
     }
 
-    /// <summary>
-    /// Safety net for when the normal warmup/match-start based timer tracking never
-    /// initializes (e.g. a custom game mode like K4-Arenas that never fires
-    /// EventWarmupEnd, leaving WarmupRunning stuck true forever). Measures elapsed
-    /// time from the unconditional MapLoadTime baseline instead, and forces the
-    /// same end-of-match flow OnWinPanelMatch would trigger if the map has clearly
-    /// overrun mp_timelimit by more than MaxOvertimeSeconds.
-    /// </summary>
-    private void CheckMatchTimeWatchdog()
+    private void CheckAutomatedVoteCore(bool force, bool fromTimer)
     {
-        if (_state.MatchEnded || _state.MapChangeScheduled) return;
-        if (_config.EndOfMap.MaxOvertimeSeconds <= 0) return;
-        if (Core.Engine == null || _state.MapLoadTime <= 0) return;
-        var timelimitConVar = Core.ConVar.Find<float>("mp_timelimit");
-        float timelimit = timelimitConVar?.Value ?? 0;
-        if (timelimit <= 0) return;
-        if (!TryGetEngineCurrentTime(out float currentTime)) return;
-        float timeSinceLoad = currentTime - _state.MapLoadTime;
-        float overtime = timeSinceLoad - (timelimit * 60);
-
-        if (overtime >= _config.EndOfMap.MaxOvertimeSeconds)
-        {
-            ForceMapEnd($"map running {overtime:F0}s past mp_timelimit with no normal end-of-match trigger");
-        }
-    }
-
-    private void CheckAutomatedVoteCore(bool force)
-    {
-        if (!_config.EndOfMap.Enabled || _state.EofVoteHappening || _state.MapChangeScheduled || _state.WarmupRunning) return;
+        if (!_config.EndOfMap.Enabled || _state.MatchEnded || _state.EofVoteHappening || _state.MapChangeScheduled || _state.WarmupRunning) return;
         if (_state.MapSwitchInFlight) return;
 
         // Silent early exit if game is not fully initialized yet (MapStartTime is set in OnWarmupEnd/OnMatchStart)
         // This prevents spamming logs with GameRules exceptions during early map load
         if (_state.MapStartTime <= 0) return;
+        if (Core.Engine == null || Core.Game == null) return;
 
-        int totalRoundsPlayed;
-        try
+        int totalRoundsPlayed = _lastTotalRounds;
+        if (!fromTimer)
         {
-            if (Core.Game.MatchData.Phase == GamePhase.GAMEPHASE_HALFTIME) return;
-            totalRoundsPlayed = Core.Game.MatchData.TerroristScoreTotal + Core.Game.MatchData.CTScoreTotal;
-        }
-        catch (InvalidOperationException)
-        {
-            // GameRules not available yet - silently skip this tick
-            return;
+            try
+            {
+                if (Core.Game.MatchData.Phase == GamePhase.GAMEPHASE_HALFTIME) return;
+                totalRoundsPlayed = Core.Game.MatchData.TerroristScoreTotal + Core.Game.MatchData.CTScoreTotal;
+                _lastTotalRounds = totalRoundsPlayed;
+            }
+            catch (InvalidOperationException) { return; }
         }
 
         bool pastDueNoMap = _state.EofVoteCompleted && string.IsNullOrEmpty(_state.NextMap);
@@ -649,6 +636,7 @@ public sealed class MapChooser : BasePlugin
             Core.GameEvent.UnhookPost<EventGamePhaseChanged>();
             Core.GameEvent.UnhookPost<EventRoundAnnounceMatchStart>();
             Core.GameEvent.UnhookPost<EventRoundAnnounceMatchPoint>();
+            Core.GameEvent.UnhookPre<EventCsWinPanelMatch>();
         }
         catch (Exception ex)
         {
@@ -660,14 +648,36 @@ public sealed class MapChooser : BasePlugin
     private void RestartVoteTimer()
     {
         _checkVoteTimer?.Cancel();
-        _checkVoteTimer = null;
-
         _checkVoteTimer = Core.Scheduler.DelayAndRepeat(1000, 1000, () =>
         {
-            Core.Scheduler.NextTick(() => CheckAutomatedVote());
+            Core.Scheduler.NextTick(() => CheckAutomatedVote(fromTimer: true));
         });
-
         Core.Scheduler.StopOnMapChange(_checkVoteTimer);
     }
 
+    /// <summary>
+    /// Safety net for when the normal warmup/match-start based timer tracking never
+    /// initializes (e.g. a custom game mode like K4-Arenas that never fires
+    /// EventWarmupEnd, leaving WarmupRunning stuck true forever). Measures elapsed
+    /// time from the unconditional MapLoadTime baseline instead, and forces the
+    /// same end-of-match flow OnWinPanelMatch would trigger if the map has clearly
+    /// overrun mp_timelimit by more than MaxOvertimeSeconds.
+    /// </summary>
+    private void CheckMatchTimeWatchdog()
+    {
+        if (_state.MatchEnded || _state.MapChangeScheduled) return;
+        if (_config.EndOfMap.MaxOvertimeSeconds <= 0) return;
+        if (Core.Engine == null || _state.MapLoadTime <= 0) return;
+        var timelimitConVar = Core.ConVar.Find<float>("mp_timelimit");
+        float timelimit = timelimitConVar?.Value ?? 0;
+        if (timelimit <= 0) return;
+        if (!TryGetEngineCurrentTime(out float currentTime)) return;
+        float timeSinceLoad = currentTime - _state.MapLoadTime;
+        float overtime = timeSinceLoad - (timelimit * 60);
+
+        if (overtime >= _config.EndOfMap.MaxOvertimeSeconds)
+        {
+            ForceMapEnd($"map running {overtime:F0}s past mp_timelimit with no normal end-of-match trigger");
+        }
+    }
 }
